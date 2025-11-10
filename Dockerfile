@@ -1,76 +1,76 @@
-# ---------- 1) Stage "vendor": installe les dépendances Composer ----------
+# -------- 1) Stage composer (facultatif si pas de composer.json) --------
 FROM composer:2 AS vendor
-
 WORKDIR /app
-
-# Copie d'abord les fichiers composer pour profiter du cache Docker
-COPY composer.json composer.lock ./
-RUN composer install --no-dev --prefer-dist --no-interaction --no-progress
-
-# Puis on copie le reste du code et on optimise l'autoload
+COPY composer.json composer.lock* ./
+RUN composer install --no-dev --prefer-dist --no-interaction --no-progress || true
 COPY . .
-RUN composer dump-autoload -o
+RUN composer dump-autoload -o || true
 
-# ---------- 2) Stage final: PHP 8.2 + Apache ----------
+# -------- 2) Image finale: PHP 8.2 + Apache --------
 FROM php:8.2-apache
 
-# (Optionnel) fuseau horaire + env de prod
-ENV TZ=Europe/Paris \
-    APP_ENV=production \
-    APACHE_DOCUMENT_ROOT=/var/www/html/public
+ENV APP_ENV=production \
+    TZ=Europe/Paris
 
-# Paquets système requis et extensions PHP utiles
+# Paquets + extensions PHP utiles
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libpng-dev libjpeg-dev libfreetype6-dev \
-      libzip-dev zip unzip \
-      libicu-dev \
-      git curl ca-certificates \
-    && docker-php-ext-configure gd --with-jpeg --with-freetype \
-    && docker-php-ext-install -j$(nproc) pdo_mysql gd zip intl opcache \
-    && rm -rf /var/lib/apt/lists/*
+      libpng-dev libjpeg-dev libfreetype6-dev libzip-dev zip unzip libicu-dev \
+      ca-certificates curl git gettext-base \
+  && docker-php-ext-configure gd --with-jpeg --with-freetype \
+  && docker-php-ext-install -j"$(nproc)" pdo_mysql gd zip intl opcache \
+  && rm -rf /var/lib/apt/lists/*
 
-# Active les modules Apache nécessaires
+# Apache: modules utiles
 RUN a2enmod rewrite headers
 
-# Configure le DocumentRoot sur /public
-RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf \
-    && sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT%/public}/!g' /etc/apache2/apache2.conf
+# --- Détection auto du DocumentRoot (public/ prioritaire sinon racine)
+#   Si /var/www/html/public existe -> DocumentRoot = .../public
+#   Sinon -> DocumentRoot = /var/www/html
+ENV APACHE_DOCUMENT_ROOT=/var/www/html
+RUN set -eux; \
+    if [ -d /var/www/html/public ]; then export APACHE_DOCUMENT_ROOT=/var/www/html/public; fi; \
+    : # placeholders
 
-# Autorise les .htaccess (AllowOverride All) sur le DocumentRoot
-RUN printf "<Directory ${APACHE_DOCUMENT_ROOT}>\n    AllowOverride All\n    Require all granted\n</Directory>\n" \
-      > /etc/apache2/conf-available/allowoverride.conf \
-    && a2enconf allowoverride
+# On ajuste les confs Apache au runtime (pour tenir compte du PORT + DocumentRoot)
+# 1) On garde des templates .template puis on injecte $PORT/$APACHE_DOCUMENT_ROOT au démarrage
+RUN mv /etc/apache2/ports.conf /etc/apache2/ports.conf.template && \
+    for f in /etc/apache2/sites-available/*.conf; do mv "$f" "$f.template"; done && \
+    printf "<Directory /var/www/html>\n    AllowOverride All\n    Require all granted\n</Directory>\n" \
+      > /etc/apache2/conf-available/allowoverride.conf && a2enconf allowoverride
 
-# Copie du code + vendor depuis le stage composer
+# Code + vendor
 WORKDIR /var/www/html
-COPY --chown=www-data:www-data --from=vendor /app ./
+COPY --from=vendor /app ./
+# Si pas de composer, on aura copié le repo plus haut, c’est OK.
 
-# (Optionnel) droits d'écriture si ton app a /storage ou /var
-# RUN chown -R www-data:www-data storage/ var/ || true
+# Droits d’écriture (décommente si tu as ces répertoires)
+# RUN chown -R www-data:www-data storage/ var/ runtime/ || true
 
-# Quelques réglages PHP de prod (opcache)
+# Réglages PHP (prod)
 RUN { \
       echo "opcache.enable=1"; \
       echo "opcache.enable_cli=0"; \
       echo "opcache.validate_timestamps=0"; \
-      echo "opcache.jit_buffer_size=0"; \
       echo "memory_limit=256M"; \
-      echo "upload_max_filesize=16M"; \
       echo "post_max_size=16M"; \
-    } > /usr/local/etc/php/conf.d/prod.ini
+      echo "upload_max_filesize=16M"; \
+    } > /usr/local/etc/php/conf.d/zz-prod.ini
 
-# IMPORTANT Railway: écouter sur $PORT (et pas 80)
-# On réécrit au démarrage la conf Apache pour utiliser la variable d'environnement PORT
+# Entrypoint: injecte $PORT et APACHE_DOCUMENT_ROOT puis démarre Apache
 CMD bash -lc '\
-  if [ -z "$PORT" ]; then export PORT=8080; fi; \
-  sed -i "s/Listen 80/Listen ${PORT}/" /etc/apache2/ports.conf; \
-  sed -i "s/:80>/:${PORT}>/g" /etc/apache2/sites-available/*.conf; \
+  : "${PORT:=8080}"; \
+  : "${APACHE_DOCUMENT_ROOT:=/var/www/html}"; \
+  if [ -d "/var/www/html/public" ]; then APACHE_DOCUMENT_ROOT="/var/www/html/public"; fi; \
+  envsubst "\$PORT" < /etc/apache2/ports.conf.template > /etc/apache2/ports.conf; \
+  for f in /etc/apache2/sites-available/*.conf.template; do \
+    envsubst "\$PORT \$APACHE_DOCUMENT_ROOT" < "$f" > "${f%.template}"; \
+  done; \
+  sed -ri -e "s#DocumentRoot .*#DocumentRoot ${APACHE_DOCUMENT_ROOT}#g" /etc/apache2/sites-available/*.conf; \
   exec apache2-foreground \
 '
 
-# EXPOSE est purement indicatif (Railway injecte le port)
 EXPOSE 8080
 
-# (Optionnel) healthcheck interne (utile en local)
+# Healthcheck (utile en local)
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD sh -lc 'curl -fsS "http://127.0.0.1:${PORT:-8080}/" >/dev/null || exit 1'

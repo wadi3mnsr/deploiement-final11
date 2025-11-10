@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+ 
+
+  php-apache:
+    build: .
+    container_name: flexvtc_app
+    ports:
+      - "8080:80"
+    volumes:
+      - ./public:/var/www/html
+      - ./includes:/var/www/html/includes
+      - ./config:/var/www/html/config
+      - ./models:/var/www/html/models
+      - ./.env:/var/www/html/.env           # ← on monte le .env dans /var/www/html
+    depends_on:
+      - db
+      - mongo
+
+  db:
+    image: mysql:8.0
+    container_name: flexvtc_db
+    environment:
+      MYSQL_ROOT_PASSWORD: flex_rootpass
+      MYSQL_DATABASE: flexvtc_db
+      MYSQL_USER: flex_user
+      MYSQL_PASSWORD: flex_userpass
+    ports:
+      - "3307:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: flexvtc_phpmyadmin
+    environment:
+      PMA_HOST: db
+      PMA_USER: flex_user
+      PMA_PASSWORD: flex_userpass
+    ports:
+      - "8081:80"
+    depends_on:
+      - db
+
+  mongo:
+    image: mongo:7
+    container_name: flexvtc_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpass
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  mongo-express:
+    image: mongo-express:1
+    container_name: flexvtc_mongo_express
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_MONGODB_ADMINUSERNAME: root
+      ME_CONFIG_MONGODB_ADMINPASSWORD: rootpass
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+    ports:
+      - "8082:8081"
+    depends_on:
+      - mongo
+
+volumes:
+  db_data:
+  mongo_data:
